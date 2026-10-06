@@ -71,3 +71,11 @@ flutter build apk --release
   take a silent, flash-off, low-resolution photo about every 1.5 s during
   a recording to keep sensing motion. On very old ("legacy" camera) phones
   this isn't possible, so clips just run for the length you set.
+
+## Download the APK
+
+Ready-to-install APKs are in the [`apk/`](apk/) folder:
+
+- `SnakeCatcher-v2.0.0-arm64.apk` — for almost all phones (recommended)
+- `SnakeCatcher-v2.0.0-arm32-oldphones.apk` — for older 32-bit phones
+- `SnakeCatcher-v2.0.0.apk` — works on every phone, but bigger
