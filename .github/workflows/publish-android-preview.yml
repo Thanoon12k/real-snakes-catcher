@@ -1,0 +1,24 @@
+name: Publish Android preview APK
+on:
+  push:
+    branches: [website-and-mobile-builds]
+    paths: [.github/workflows/publish-android-preview.yml]
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: snake-catcher-android-test-apk
+          github-token: ${{ github.token }}
+          repository: Thanoon12k/real-snakes-catcher
+          run-id: 37513282376
+          path: apk
+      - name: Publish the successful build as an experimental preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create android-preview-20261006 apk/app-release.apk --repo Thanoon12k/real-snakes-catcher --target 71a53895154b6c0a1ae1d4a42afbd6a59b03b89a --prerelease --title "Snake Catcher Android — experimental preview" --notes "Experimental Android APK built from the existing Flutter app. Motion unit tests and release compilation passed. This APK uses test/debug signing and has not been validated on physical devices. It is not a production security or animal-capture product. A future production release with a different signing key may require uninstalling this build first; back up recordings before doing so. iOS is not included because Apple signing and distribution are still required."
