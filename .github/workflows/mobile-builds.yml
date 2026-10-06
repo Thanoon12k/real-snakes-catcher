@@ -23,7 +23,8 @@ jobs:
       - name: Restore generated Android tooling
         run: flutter create --platforms=android --project-name snake_catcher --org com.thanoon .
       - run: flutter pub get
-      - run: flutter test
+      - name: Run repository motion tests (exclude generated template tests)
+        run: flutter test test/motion_test.dart
       - run: flutter build apk --release
       - uses: actions/upload-artifact@v4
         with:
@@ -44,7 +45,8 @@ jobs:
       - name: Configure iOS permissions
         run: python3 mobile-ci/configure_ios.py
       - run: flutter pub get
-      - run: flutter test
+      - name: Run repository motion tests (exclude generated template tests)
+        run: flutter test test/motion_test.dart
       - run: flutter build ios --release --no-codesign
       - uses: actions/upload-artifact@v4
         with:
