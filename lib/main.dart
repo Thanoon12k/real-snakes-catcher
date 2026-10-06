@@ -1,437 +1,551 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
-import 'dart:math' as math;
+
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
-import 'package:path_provider/path_provider.dart';
+import 'package:flutter/services.dart';
+import 'package:gal/gal.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+
+import 'clips.dart';
+import 'motion.dart';
 import 'recordings_page.dart';
+import 'settings_page.dart';
+import 'telegram_bot.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(NightGuard(cameras: await availableCameras()));
+  await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+  List<CameraDescription> cameras = [];
+  try {
+    cameras = await availableCameras();
+  } catch (_) {}
+  runApp(SnakeCatcherApp(cameras: cameras));
 }
 
-class NightGuard extends StatelessWidget {
+class SnakeCatcherApp extends StatelessWidget {
   final List<CameraDescription> cameras;
-  const NightGuard({super.key, required this.cameras});
+  const SnakeCatcherApp({super.key, required this.cameras});
+
   @override
   Widget build(BuildContext context) => MaterialApp(
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark(useMaterial3: true),
-      home: GuardPage(cameras: cameras));
+        title: 'Snake Catcher',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(
+          useMaterial3: true,
+          brightness: Brightness.dark,
+          colorSchemeSeed: const Color(0xFF3FAE5A),
+        ),
+        home: GuardPage(cameras: cameras),
+      );
 }
 
 class GuardPage extends StatefulWidget {
   final List<CameraDescription> cameras;
   const GuardPage({super.key, required this.cameras});
+
   @override
   State<GuardPage> createState() => _GuardPageState();
 }
 
 class _GuardPageState extends State<GuardPage> {
+  static const clipLengths = [5, 10, 30, 60, 120, 180, 300];
+
+  /// A clip keeps extending while motion continues, but never beyond this.
+  static const maxClip = Duration(minutes: 5);
+  static const analyseEvery = Duration(milliseconds: 300);
+
+  final bot = TelegramBot();
   CameraController? c;
-  bool armed = false,
-      recording = false,
-      busy = false,
-      sending = false,
-      telegramEnabled = false;
-  double sensitivity = .13, lastMotion = 0;
-  int seconds = 60, clips = 0;
-  List<int>? previous;
-  DateTime? lastAnalysis;
-  String status = 'جاهز', botToken = '', chatId = '', cameraMode = 'day';
+
+  bool armed = false, recording = false, starting = false;
+  double slider = sliderFromThreshold(0.01), lastMotion = 0;
+  int clipSeconds = 60, clips = 0, hits = 0;
+  String cameraMode = 'day', status = 'Starting camera…';
+
+  Float32List? prevGrid, prevPhotoGrid;
+  DateTime lastAnalysis = DateTime(0), lastMotionAt = DateTime(0);
+
+  // Current recording.
+  String? recId;
+  DateTime? recStart, recEnd, lastRecFrame;
+  bool photoFallback = true, analysing = false;
+  Timer? ticker;
+
+  double get threshold => thresholdFromSlider(slider);
+  bool get ready => c?.value.isInitialized == true;
+
   @override
   void initState() {
     super.initState();
-    _load();
-    _init();
+    bot
+      ..isRecording = ((id) => recording && id == recId)
+      ..currentRecordingId = (() => recording ? recId : null)
+      ..statusText = _statusForBot;
+    _start();
   }
 
-  Future<void> _load() async {
+  Future<void> _start() async {
     final p = await SharedPreferences.getInstance();
-    if (!mounted) return;
-    setState(() {
-      botToken = p.getString('botToken') ?? '';
-      chatId = p.getString('chatId') ?? '';
-      telegramEnabled = p.getBool('telegramEnabled') ?? false;
-      sensitivity = p.getDouble('sensitivity') ?? .13;
-      seconds = p.getInt('seconds') ?? 60;
-      cameraMode = p.getString('cameraMode') ?? 'day';
-    });
+    slider = p.getDouble('slider') ?? slider;
+    final saved = p.getInt('clipSeconds') ?? 60;
+    clipSeconds = clipLengths.contains(saved) ? saved : 60;
+    cameraMode = p.getString('cameraMode') ?? 'day';
+    await bot.load();
+    bot.restartPolling();
+    if (mounted) setState(() {});
+    await _initCamera();
   }
 
-  Future<void> _init() async {
+  Future<void> _initCamera() async {
     if (widget.cameras.isEmpty) {
-      setState(() => status = 'لا توجد كاميرا');
+      setState(() => status = 'No camera found');
       return;
     }
     await [Permission.camera, Permission.microphone].request();
+    try {
+      await Gal.requestAccess();
+    } catch (_) {}
     final back = widget.cameras.firstWhere(
         (x) => x.lensDirection == CameraLensDirection.back,
         orElse: () => widget.cameras.first);
     c = CameraController(back, ResolutionPreset.medium,
         enableAudio: true, imageFormatGroup: ImageFormatGroup.yuv420);
-    await c!.initialize();
-    if (mounted) setState(() => status = 'اضغط بدء المراقبة');
-  }
-
-  Future<void> toggle() async => armed ? stop() : start();
-  Future<void> start() async {
-    if (c == null || !c!.value.isInitialized) return;
-    await WakelockPlus.enable();
-    previous = null;
-    armed = true;
-    setState(() => status = 'مراقبة الحركة...');
-    await c!.startImageStream(_frame);
-  }
-
-  Future<void> stop() async {
-    armed = false;
-    if (c?.value.isStreamingImages == true) await c!.stopImageStream();
-    await WakelockPlus.disable();
-    if (mounted) setState(() => status = 'متوقف');
-  }
-
-  void _frame(CameraImage img) {
-    if (!armed || recording || busy) return;
-    final now = DateTime.now();
-    if (lastAnalysis != null &&
-        now.difference(lastAnalysis!).inMilliseconds < 350) return;
-    lastAnalysis = now;
-    busy = true;
     try {
-      final y = img.planes[0].bytes, cur = <int>[];
-      final step = math.max(1, y.length ~/ 900);
-      for (int i = 0; i < y.length && cur.length < 900; i += step)
-        cur.add(y[i]);
-      if (previous != null && previous!.length == cur.length) {
-        double sum = 0;
-        for (int i = 0; i < cur.length; i++)
-          sum += (cur[i] - previous![i]).abs();
-        lastMotion = sum / (cur.length * 255);
-        if (cameraMode == 'night')
-          lastMotion = math.min(1.0, lastMotion * 1.35);
-        if (mounted) setState(() {});
-        if (lastMotion > sensitivity) Future.microtask(_trigger);
-      }
-      previous = cur;
-    } finally {
-      busy = false;
+      await c!.initialize();
+      // Motion checks take photos while recording; never fire the flash.
+      await c!.setFlashMode(FlashMode.off).catchError((_) {});
+      await c!.startImageStream(_onFrame);
+      if (mounted) setState(() => status = 'Ready — press Start guard');
+    } catch (e) {
+      if (mounted) setState(() => status = 'Camera error: $e');
     }
   }
 
-  Future<void> _trigger() async {
-    if (recording || !armed || c == null) return;
-    recording = true;
-    File? saved;
+  // ------------------------------------------------------------ motion
+
+  void _onFrame(CameraImage image) {
+    final now = DateTime.now();
+    if (recording) lastRecFrame = now;
+    if (now.difference(lastAnalysis) < analyseEvery) return;
+    lastAnalysis = now;
+
+    final grid = gridFromCameraImage(image);
+    final prev = prevGrid;
+    prevGrid = grid;
+    if (prev == null) return;
+    _gotMotionScore(motionScore(prev, grid, noiseFor(cameraMode)));
+
+    if (!armed || recording || starting) return;
+    hits = lastMotion > threshold ? hits + 1 : 0;
+    // Two motion frames in a row (~0.3 s apart) to ignore single-frame noise.
+    if (hits >= 2) {
+      hits = 0;
+      _startClip(FrameSnapshot.of(image, c!.description.sensorOrientation));
+    }
+  }
+
+  void _gotMotionScore(double score) {
+    lastMotion = score;
+    if (score > threshold) {
+      lastMotionAt = DateTime.now();
+      if (recording) _extendClip();
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _extendClip() {
+    final start = recStart, end = recEnd;
+    if (start == null || end == null) return;
+    final want = DateTime.now().add(Duration(seconds: clipSeconds));
+    final cap = start.add(maxClip);
+    final newEnd = want.isBefore(cap) ? want : cap;
+    if (newEnd.isAfter(end)) recEnd = newEnd;
+  }
+
+  /// While recording, most phones cannot also stream frames. On those we
+  /// take a silent low-resolution photo every ~1.5 s to keep sensing.
+  Future<void> _photoMotionCheck() async {
+    if (analysing) return;
+    analysing = true;
+    try {
+      final shot = await c!.takePicture();
+      final grid = await compute(gridFromJpegFile, shot.path);
+      File(shot.path).delete().ignore();
+      if (grid == null) return;
+      final prev = prevPhotoGrid;
+      prevPhotoGrid = grid;
+      if (prev != null) {
+        _gotMotionScore(motionScore(prev, grid, noiseFor(cameraMode)));
+      }
+    } catch (e) {
+      // This phone cannot take photos while recording; clips will use
+      // their set length without extending.
+      photoFallback = false;
+      debugPrint('Photo motion check unavailable: $e');
+    } finally {
+      analysing = false;
+    }
+  }
+
+  // ---------------------------------------------------------- recording
+
+  Future<void> _startClip(FrameSnapshot frame) async {
+    starting = true;
+    final id = Clips.newId(DateTime.now());
     try {
       if (c!.value.isStreamingImages) await c!.stopImageStream();
-      await _sendMotionAlert();
-      await c!.startVideoRecording();
-      if (mounted)
-        setState(() => status = 'تم اكتشاف حركة — تسجيل $seconds ثانية');
-      await Future.delayed(Duration(seconds: seconds));
-      if (!c!.value.isRecordingVideo) return;
-      final x = await c!.stopVideoRecording();
-      final dir = await getApplicationDocumentsDirectory(),
-          folder = Directory('${dir.path}/NightGuard');
-      if (!await folder.exists()) await folder.create(recursive: true);
-      final stamp = DateTime.now().toIso8601String().replaceAll(':', '-');
-      saved = await File(x.path).copy('${folder.path}/motion_$stamp.mp4');
-      clips++;
-      if (telegramEnabled &&
-          botToken.trim().isNotEmpty &&
-          chatId.trim().isNotEmpty) await _sendTelegram(saved);
+      await c!.startVideoRecording(onAvailable: _onFrame);
+      recId = id;
+      recStart = DateTime.now();
+      recEnd = recStart!.add(Duration(seconds: clipSeconds));
+      lastRecFrame = null;
+      prevGrid = null;
+      prevPhotoGrid = null;
+      recording = true;
+      ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() {});
+      });
+      if (mounted) setState(() => status = 'Motion detected — recording');
+      unawaited(_sendAlert(id, frame));
+      unawaited(_recordLoop());
     } catch (e) {
-      if (mounted) setState(() => status = 'خطأ: $e');
+      if (mounted) setState(() => status = 'Could not start recording: $e');
+      await _resumeStream();
+    } finally {
+      starting = false;
+    }
+  }
+
+  Future<void> _sendAlert(String id, FrameSnapshot frame) async {
+    if (!bot.ready || bot.recipients.isEmpty) return;
+    Uint8List? jpeg;
+    try {
+      jpeg = await compute(frameToJpeg, frame);
+    } catch (e) {
+      debugPrint('Snapshot failed: $e');
+    }
+    final sent = await bot.sendMotionAlert(id, jpeg);
+    if (mounted && sent == 0) {
+      setState(() => status = 'Telegram alert failed: ${bot.lastError}');
+    }
+  }
+
+  Future<void> _recordLoop() async {
+    DateTime lastPhoto = DateTime.now();
+    while (true) {
+      await Future.delayed(const Duration(milliseconds: 250));
+      final now = DateTime.now();
+      if (!armed || !recording || now.isAfter(recEnd!)) break;
+      final streaming = lastRecFrame != null &&
+          now.difference(lastRecFrame!) < const Duration(seconds: 2);
+      final settled = now.difference(recStart!) > const Duration(seconds: 2);
+      if (!streaming &&
+          settled &&
+          photoFallback &&
+          now.difference(lastPhoto) > const Duration(milliseconds: 1500)) {
+        lastPhoto = now;
+        await _photoMotionCheck();
+      }
+    }
+    await _finishClip();
+  }
+
+  Future<void> _finishClip() async {
+    final id = recId!;
+    ticker?.cancel();
+    try {
+      final x = await c!.stopVideoRecording();
+      final dest = await Clips.fileFor(id);
+      try {
+        await File(x.path).rename(dest.path);
+      } catch (_) {
+        await File(x.path).copy(dest.path);
+        await File(x.path).delete();
+      }
+      clips++;
+      recording = false;
+      try {
+        await Gal.putVideo(dest.path, album: Clips.galleryAlbum);
+        status = 'Saved clip $clips to Gallery → ${Clips.galleryAlbum}';
+      } catch (e) {
+        status = 'Saved in app (gallery failed: $e)';
+      }
+      unawaited(bot.clipReady(id));
+    } catch (e) {
+      status = 'Recording error: $e';
     } finally {
       recording = false;
-      previous = null;
-      if (armed) {
-        await Future.delayed(const Duration(milliseconds: 500));
-        await c!.startImageStream(_frame);
-        if (mounted)
-          setState(() => status = 'مراقبة الحركة... ($clips تسجيلات)');
-      }
+      recId = null;
+      recStart = recEnd = null;
+      await _resumeStream();
+      if (!armed) await WakelockPlus.disable();
+      if (mounted) setState(() {});
     }
   }
 
-  Future<void> _sendMotionAlert() async {
-    if (!telegramEnabled || botToken.trim().isEmpty || chatId.trim().isEmpty) {
-      return;
-    }
-
+  Future<void> _resumeStream() async {
+    prevGrid = null;
+    hits = 0;
+    if (c == null || !ready || c!.value.isStreamingImages) return;
     try {
-      final response = await http.post(
-        Uri.parse(
-          'https://api.telegram.org/bot${botToken.trim()}/sendMessage',
-        ),
-        body: {
-          'chat_id': chatId.trim(),
-          'text':
-              '🚨 Night Guard\nMotion detected!\n🕐 ${DateTime.now().toLocal()}\n🎥 Recording is starting now...',
-        },
-      ).timeout(const Duration(seconds: 10));
-
-      debugPrint(
-        'Instant Telegram alert: ${response.statusCode}',
-      );
+      await c!.startImageStream(_onFrame);
     } catch (e) {
-      debugPrint('Instant Telegram alert failed: $e');
+      debugPrint('Could not restart image stream: $e');
     }
   }
 
-  Future<bool> _sendTelegram(File f) async {
-    sending = true;
-    if (mounted) setState(() => status = 'إرسال الفيديو إلى Telegram...');
-    try {
-      final uri =
-          Uri.parse('https://api.telegram.org/bot${botToken.trim()}/sendVideo');
-      final r = http.MultipartRequest('POST', uri)
-        ..fields['chat_id'] = chatId.trim()
-        ..fields['caption'] =
-            '🚨 Night Guard: تم اكتشاف حركة\n🕐 ${DateTime.now().toLocal()}\n🎥 $seconds ثانية'
-        ..files.add(await http.MultipartFile.fromPath('video', f.path));
-      final res = await r.send().timeout(const Duration(minutes: 3));
-      final body = await res.stream.bytesToString();
-      if (res.statusCode == 200 && ((jsonDecode(body) as Map)['ok'] == true)) {
-        final p = await SharedPreferences.getInstance();
-        await p.setString(
-            'telegram_' + f.path.split(Platform.pathSeparator).last, 'sent');
-        return true;
-      } else {
-        final p = await SharedPreferences.getInstance();
-        await p.setString(
-            'telegram_' + f.path.split(Platform.pathSeparator).last, 'failed');
-      }
-      if (mounted)
-        setState(() =>
-            status = 'حُفظ الفيديو، لكن فشل Telegram (${res.statusCode})');
-      return false;
-    } catch (_) {
-      if (mounted)
-        setState(() => status = 'حُفظ الفيديو، لكن تعذر إرساله إلى Telegram');
-      return false;
-    } finally {
-      sending = false;
+  // --------------------------------------------------------------- guard
+
+  Future<void> _toggle() async {
+    if (armed) {
+      // Any running clip is finished and saved by the record loop.
+      setState(() {
+        armed = false;
+        status = recording ? 'Stopping — saving clip…' : 'Guard stopped';
+      });
+      if (!recording) await WakelockPlus.disable();
+    } else {
+      await WakelockPlus.enable();
+      hits = 0;
+      setState(() {
+        armed = true;
+        status = 'Watching for motion…';
+      });
     }
   }
 
-  Future<void> _settings() async {
-    if (armed) return;
-    final token = TextEditingController(text: botToken),
-        chat = TextEditingController(text: chatId);
-    bool enabled = telegramEnabled;
-    await showDialog(
-        context: context,
-        builder: (ctx) => StatefulBuilder(
-            builder: (ctx, setD) => AlertDialog(
-                    title: const Text('إعدادات Telegram'),
-                    content: SingleChildScrollView(
-                        child:
-                            Column(mainAxisSize: MainAxisSize.min, children: [
-                      DropdownButtonFormField<String>(
-                          value: cameraMode,
-                          decoration:
-                              const InputDecoration(labelText: 'وضع التصوير'),
-                          items: const [
-                            DropdownMenuItem(
-                                value: 'day',
-                                child: Text('☀️ نهاري (الافتراضي)')),
-                            DropdownMenuItem(
-                                value: 'night', child: Text('🌙 ليلي'))
-                          ],
-                          onChanged: (v) {
-                            if (v != null) setD(() => cameraMode = v);
-                          }),
-                      const SizedBox(height: 10),
-                      SwitchListTile(
-                          contentPadding: EdgeInsets.zero,
-                          title: const Text('إرسال المقاطع تلقائياً'),
-                          value: enabled,
-                          onChanged: (v) => setD(() => enabled = v)),
-                      TextField(
-                          controller: token,
-                          obscureText: true,
-                          autocorrect: false,
-                          enableSuggestions: false,
-                          decoration: const InputDecoration(
-                              labelText: 'Bot Token',
-                              hintText: '123456:ABC...')),
-                      const SizedBox(height: 12),
-                      TextField(
-                          controller: chat,
-                          keyboardType: TextInputType.text,
-                          decoration: const InputDecoration(
-                              labelText: 'Chat ID',
-                              hintText: 'مثال: 123456789 أو -100...')),
-                      const SizedBox(height: 12),
-                      const Text(
-                          'أنشئ البوت عبر BotFather، أرسل له رسالة أولاً، ثم أدخل Token وChat ID هنا. البيانات تبقى على هذا الهاتف.',
-                          style: TextStyle(fontSize: 12, color: Colors.white70))
-                    ])),
-                    actions: [
-                      TextButton(
-                          onPressed: () => Navigator.pop(ctx),
-                          child: const Text('إلغاء')),
-                      FilledButton(
-                          onPressed: () async {
-                            botToken = token.text.trim();
-                            chatId = chat.text.trim();
-                            telegramEnabled = enabled;
-                            final p = await SharedPreferences.getInstance();
-                            await p.setString('botToken', botToken);
-                            await p.setString('chatId', chatId);
-                            await p.setBool('telegramEnabled', telegramEnabled);
-                            await p.setString('cameraMode', cameraMode);
-                            if (ctx.mounted) Navigator.pop(ctx);
-                            if (mounted) setState(() {});
-                          },
-                          child: const Text('حفظ'))
-                    ])));
-  }
+  String _statusForBot() => armed
+      ? '🟢 Guard is ON${recording ? ' — 🔴 recording now' : ''}.\n'
+          'Clips this session: $clips'
+      : '⚪ Guard is OFF.';
 
-  Future<void> _testTelegram() async {
-    if (botToken.isEmpty || chatId.isEmpty) {
-      setState(() => status = 'أدخل Bot Token و Chat ID أولاً');
-      return;
-    }
-    try {
-      setState(() => status = 'اختبار Telegram...');
-      final r = await http.post(
-          Uri.parse(
-              'https://api.telegram.org/bot${botToken.trim()}/sendMessage'),
-          body: {
-            'chat_id': chatId.trim(),
-            'text': '✅ Night Guard متصل بنجاح'
-          }).timeout(const Duration(seconds: 20));
-      setState(() => status = r.statusCode == 200
-          ? 'تم إرسال رسالة الاختبار ✓'
-          : 'فشل الاختبار (${r.statusCode})');
-    } catch (e) {
-      setState(() => status = 'فشل اختبار Telegram');
-    }
+  Future<void> _openSettings() async {
+    final mode = await Navigator.push<String>(
+        context,
+        MaterialPageRoute(
+            builder: (_) => SettingsPage(bot: bot, cameraMode: cameraMode)));
+    if (mode != null && mounted) setState(() => cameraMode = mode);
   }
 
   @override
   void dispose() {
     armed = false;
+    ticker?.cancel();
+    bot.stopPolling();
     c?.dispose();
     WakelockPlus.disable();
     super.dispose();
   }
 
+  // ------------------------------------------------------------------ UI
+
   @override
   Widget build(BuildContext context) {
-    final ready = c?.value.isInitialized == true;
+    final elapsed =
+        recStart == null ? 0 : DateTime.now().difference(recStart!).inSeconds;
     return Scaffold(
-        appBar:
-            AppBar(title: const Text('Night Guard — حارس الغرفة'), actions: [
-          IconButton(
-              onPressed: armed
-                  ? null
-                  : () {
-                      Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                              builder: (_) => RecordingsPage(
-                                  botToken: botToken,
-                                  chatId: chatId,
-                                  telegramEnabled: telegramEnabled)));
-                    },
-              icon: const Icon(Icons.video_library),
-              tooltip: 'Recordings'),
-          IconButton(
-              onPressed: armed ? null : _settings,
-              icon: const Icon(Icons.settings),
-              tooltip: 'الإعدادات')
+      appBar: AppBar(
+        title: const Row(children: [
+          Image(image: AssetImage('assets/icon.png'), width: 30, height: 30),
+          SizedBox(width: 10),
+          Text('Snake Catcher'),
         ]),
-        body: SafeArea(
-            child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: Column(children: [
-                  Expanded(
-                      child: ClipRRect(
-                          borderRadius: BorderRadius.circular(18),
-                          child: Container(
-                              color: Colors.black,
-                              child: ready
-                                  ? Center(child: CameraPreview(c!))
-                                  : const Center(
-                                      child: CircularProgressIndicator())))),
-                  const SizedBox(height: 10),
-                  Row(children: [
-                    Expanded(child: Text(status)),
-                    Text('حركة ${(lastMotion * 100).toStringAsFixed(1)}%')
+        actions: [
+          IconButton(
+            tooltip: 'Recordings',
+            icon: const Icon(Icons.video_library),
+            onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                    builder: (_) => RecordingsPage(
+                        bot: bot,
+                        recordingId: () => recording ? recId : null))),
+          ),
+          IconButton(
+              tooltip: 'Settings',
+              icon: const Icon(Icons.settings),
+              onPressed: _openSettings),
+        ],
+      ),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Column(children: [
+            Expanded(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(18),
+                child: Container(
+                  color: Colors.black,
+                  child: Stack(fit: StackFit.expand, children: [
+                    ready
+                        ? Center(child: CameraPreview(c!))
+                        : const Center(child: CircularProgressIndicator()),
+                    if (recording)
+                      Positioned(
+                          top: 12,
+                          left: 12,
+                          child: _RecBadge(seconds: elapsed)),
+                    if (armed && !recording)
+                      const Positioned(
+                        top: 12,
+                        left: 12,
+                        child:
+                            _Pill(color: Color(0xCC2E7D32), text: '● GUARDING'),
+                      ),
                   ]),
-                  Row(children: [
-                    const Text('الحساسية'),
-                    Expanded(
-                        child: Slider(
-                            value: sensitivity,
-                            min: .005,
-                            max: .30,
-                            divisions: 59,
-                            onChanged: armed
-                                ? null
-                                : (v) async {
-                                    setState(() => sensitivity = v);
-                                    (await SharedPreferences.getInstance())
-                                        .setDouble('sensitivity', v);
-                                  })),
-                    Text('${(sensitivity * 100).round()}%')
-                  ]),
-                  Row(children: [
-                    const Text('مدة التسجيل'),
-                    const SizedBox(width: 10),
-                    DropdownButton<int>(
-                        value: seconds,
-                        onChanged: armed
-                            ? null
-                            : (v) async {
-                                setState(() => seconds = v!);
-                                (await SharedPreferences.getInstance())
-                                    .setInt('seconds', v!);
-                              },
-                        items: [30, 60, 90, 120]
-                            .map((v) => DropdownMenuItem(
-                                value: v, child: Text('$v ثانية')))
-                            .toList()),
-                    Text(cameraMode == 'day' ? '☀️ نهاري' : '🌙 ليلي'),
-                    const Spacer(),
-                    Icon(
-                        telegramEnabled
-                            ? Icons.telegram
-                            : Icons.telegram_outlined,
-                        size: 18),
-                    const SizedBox(width: 4),
-                    Text(telegramEnabled ? 'Telegram مفعّل' : 'Telegram متوقف')
-                  ]),
-                  if (!armed && telegramEnabled)
-                    Align(
-                        alignment: Alignment.centerRight,
-                        child: TextButton.icon(
-                            onPressed: sending ? null : _testTelegram,
-                            icon: const Icon(Icons.send),
-                            label: const Text('اختبار Telegram'))),
-                  const SizedBox(height: 6),
-                  SizedBox(
-                      width: double.infinity,
-                      height: 54,
-                      child: FilledButton.icon(
-                          onPressed: ready && !recording ? toggle : null,
-                          icon: Icon(armed ? Icons.stop : Icons.visibility),
-                          label:
-                              Text(armed ? 'إيقاف المراقبة' : 'بدء المراقبة'))),
-                  const SizedBox(height: 7),
-                  const Text(
-                      'كل فيديو يُحفظ محلياً أولاً. عند تفعيل Telegram يُرسل تلقائياً بعد انتهاء التسجيل.',
-                      style: TextStyle(fontSize: 12, color: Colors.white70))
-                ]))));
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(
+                  child: Text(status,
+                      maxLines: 2, overflow: TextOverflow.ellipsis)),
+              const SizedBox(width: 8),
+              Text('Motion ${percent(lastMotion)}',
+                  style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: lastMotion > threshold ? Colors.redAccent : null)),
+            ]),
+            const SizedBox(height: 6),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: lastMotion <= 0 ? 0 : sliderFromThreshold(lastMotion),
+                minHeight: 6,
+                color: lastMotion > threshold ? Colors.redAccent : Colors.green,
+              ),
+            ),
+            Row(children: [
+              const Text('Trigger at'),
+              Expanded(
+                child: Slider(
+                  value: slider,
+                  onChanged: (v) => setState(() => slider = v),
+                  onChangeEnd: (v) async =>
+                      (await SharedPreferences.getInstance())
+                          .setDouble('slider', v),
+                ),
+              ),
+              SizedBox(
+                  width: 56,
+                  child: Text(percent(threshold), textAlign: TextAlign.end)),
+            ]),
+            Row(children: [
+              const Text('Clip length'),
+              const SizedBox(width: 10),
+              DropdownButton<int>(
+                value: clipSeconds,
+                onChanged: (v) async {
+                  setState(() => clipSeconds = v!);
+                  (await SharedPreferences.getInstance())
+                      .setInt('clipSeconds', v!);
+                },
+                items: [
+                  for (final s in clipLengths)
+                    DropdownMenuItem(value: s, child: Text(Clips.lengthText(s)))
+                ],
+              ),
+              const SizedBox(width: 8),
+              Icon(cameraMode == 'day' ? Icons.wb_sunny : Icons.nightlight,
+                  size: 18),
+              const Spacer(),
+              Icon(Icons.telegram,
+                  size: 18,
+                  color: bot.ready ? Colors.lightBlueAccent : Colors.white38),
+              const SizedBox(width: 4),
+              Text(bot.ready
+                  ? '${bot.recipients.length} subscribed'
+                  : 'Telegram off'),
+            ]),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              height: 54,
+              child: FilledButton.icon(
+                style: armed
+                    ? FilledButton.styleFrom(
+                        backgroundColor: Colors.red.shade700)
+                    : null,
+                onPressed: ready ? _toggle : null,
+                icon: Icon(armed ? Icons.stop : Icons.visibility),
+                label: Text(armed ? 'Stop guard' : 'Start guard'),
+              ),
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              'Clips keep recording while motion continues (max 5 min) and are saved to '
+              'Gallery → ${Clips.galleryAlbum}. Telegram gets the first photo; '
+              'subscribers tap "Get full video" to receive the clip.',
+              style: TextStyle(fontSize: 11, color: Colors.white60),
+              textAlign: TextAlign.center,
+            ),
+          ]),
+        ),
+      ),
+    );
   }
+}
+
+class _RecBadge extends StatefulWidget {
+  final int seconds;
+  const _RecBadge({required this.seconds});
+
+  @override
+  State<_RecBadge> createState() => _RecBadgeState();
+}
+
+class _RecBadgeState extends State<_RecBadge>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController blink = AnimationController(
+      vsync: this, duration: const Duration(milliseconds: 700))
+    ..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    blink.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final m = widget.seconds ~/ 60, s = widget.seconds % 60;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+          color: Colors.black54, borderRadius: BorderRadius.circular(20)),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        FadeTransition(
+          opacity: blink,
+          child: const Icon(Icons.circle, color: Colors.red, size: 14),
+        ),
+        const SizedBox(width: 6),
+        Text('REC $m:${s.toString().padLeft(2, '0')}',
+            style: const TextStyle(
+                color: Colors.white, fontWeight: FontWeight.bold)),
+      ]),
+    );
+  }
+}
+
+class _Pill extends StatelessWidget {
+  final Color color;
+  final String text;
+  const _Pill({required this.color, required this.text});
+
+  @override
+  Widget build(BuildContext context) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+            color: color, borderRadius: BorderRadius.circular(20)),
+        child: Text(text,
+            style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+                fontSize: 12)),
+      );
 }
